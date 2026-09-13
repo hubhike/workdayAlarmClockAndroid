@@ -1,8 +1,6 @@
 name: 构建 arm64-v8a 版 APK（未签名）
 
 on:
-  push:
-    branches: [ my ]
   workflow_dispatch:
 
 jobs:
