@@ -10,6 +10,7 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Typeface
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +19,10 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.support.v4.media.session.MediaSessionCompat
+import android.text.Spannable
+import android.text.SpannableString
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
@@ -32,30 +37,31 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
-import androidx.core.widget.TextViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.widget.TextViewCompat
 import com.zyyme.workdayalarmclock.applist.AppListActivity
 import com.zyyme.workdayalarmclock.camera.AmbientBrightnessController
 import com.zyyme.workdayalarmclock.camera.FramebufferBitmapReaper
 import com.zyyme.workdayalarmclock.camera.FramebufferFrameRenderer
-
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 /**
- * 时钟
+ * 时钟 (终极融合版：动态壁纸 + 农历/防烧屏/自定义UI + Framebuffer串流)
  */
 class ClockActivity : AppCompatActivity() {
     companion object {
         @Volatile
         var me: ClockActivity? = null
-
         private const val HOUR_MILLIS = 60L * 60L * 1000L
     }
 
@@ -65,29 +71,40 @@ class ClockActivity : AppCompatActivity() {
 
     private var timeHandler: Handler = Handler()
     private var runnable: Runnable? = null
-    var sdfHmsmde = SimpleDateFormat("h:mm:ss.M月d日 E")
+    // 注意：这里去掉了秒前面的冒号，为了配合 SpannableString 精准截取秒数
+    var sdfHmsmde = SimpleDateFormat("h:mmss.M月d日 E")
 
     var isKeepScreenOn = false
-
     private var showMsgUntil = 0L
-
     var clockMode = false
-
     private var returnPackage: String? = null
-
     var enableTop = false
-
     private var showLyrics = false
     private val lyricsOnTop get() = showLyrics && clockMode
     private var isVerticalLayout = false
-
     private var isUserSeeking = false
 
+    // 🛡️ 防烧屏位移相关变量
+    private var burnInOffsetX = 0f
+    private var burnInOffsetY = 0f
+    private var burnInVelocityX = 0f
+    private var burnInVelocityY = 0f
+    private var maxBurnInOffsetX = 0f
+    private var maxBurnInOffsetY = 0f
+    
+    // 记录时间控件的基准高度，用于无极放大时动态突破限制
+    private var baseTimeHeight = 0
+
+    // 🌟 农历缓存变量，避免每秒重复计算
+    private var cachedLunarString: String = ""
+    private var cachedLunarDay: Int = -1
+
+    private val prefs get() = getSharedPreferences("workday_alarm_settings", Context.MODE_PRIVATE)
+
+    // 🖼️ 自动壁纸相关变量
     private lateinit var wallpaperView: ImageView
     private lateinit var wallpaperMaskView: View
     private var wallpaperBitmap: Bitmap? = null
-    private var framebufferOverlay: ImageView? = null
-    private var framebufferBitmap: Bitmap? = null
     private val autoWallpaperDirectory = File("/sdcard/zyymeWallpaper")
     private var autoWallpaperFiles = emptyList<File>()
     private var autoWallpaperIndex = -1
@@ -101,6 +118,10 @@ class ClockActivity : AppCompatActivity() {
         }
     }
 
+    // 🖥️ Framebuffer 串流相关变量 (来自第一版)
+    private var framebufferOverlay: ImageView? = null
+    private var framebufferBitmap: Bitmap? = null
+
     fun showMsg(msg: String) {
         runOnUiThread {
             showMsgUntil = SystemClock.elapsedRealtime() + 3000
@@ -112,18 +133,29 @@ class ClockActivity : AppCompatActivity() {
         }
     }
 
+    // --- 设置项读取与保存 ---
+    private fun getFontScale(): Float = prefs.getFloat("key_font_scale", 1.0f)
+    private fun setFontScale(scale: Float) = prefs.edit().putFloat("key_font_scale", scale).apply()
+
+    private fun getFontWeight(): Int = prefs.getInt("key_font_weight", 1) 
+    private fun setFontWeight(weight: Int) = prefs.edit().putInt("key_font_weight", weight).apply()
+    private fun getWeightText(w: Int) = when(w) { 0 -> "正常"; 1 -> "加粗"; 2 -> "特粗"; else -> "正常" }
+
+    private fun getTimeDateMargin(): Int = prefs.getInt("key_time_date_margin", -20) 
+    private fun setTimeDateMargin(margin: Int) = prefs.edit().putInt("key_time_date_margin", margin).apply()
+
+    private fun getDateFontScale(): Float = prefs.getFloat("key_date_font_scale", 1.0f)
+    private fun setDateFontScale(scale: Float) = prefs.edit().putFloat("key_date_font_scale", scale).apply()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         me = this
-
         super.onCreate(savedInstanceState)
         returnPackage = intent.getStringExtra(HomeLauncherActivity.EXTRA_RETURN_PACKAGE)
 
-        // 启动Go服务 如果App以特殊方式启动
         if (MeService.me == null) {
             startService(Intent(this, MeService::class.java))
         }
 
-        // 可以显示在锁屏上
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -134,44 +166,35 @@ class ClockActivity : AppCompatActivity() {
             )
         }
 
-        // 横屏flag 会根据重力自动选择时钟模式的横屏方向
         if (resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE && MeSettings.isEnabled(this, MeSettings.KEY_LANDSCAPE)) {
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         }
 
-        // 不显示秒的flag  24小时制flag
         val flag24 = MeSettings.isEnabled(this, MeSettings.KEY_T24)
-        if (MeSettings.isEnabled(this, MeSettings.KEY_TSS)) {
-            if (flag24) {
-                sdfHmsmde = SimpleDateFormat("H:mm.M月d日 E")
-            } else {
-                sdfHmsmde = SimpleDateFormat("h:mm.M月d日 E")
-            }
-        } else if (flag24) {
-            sdfHmsmde = SimpleDateFormat("H:mm:ss.M月d日 E")
+        val isNoSeconds = MeSettings.isEnabled(this, MeSettings.KEY_TSS)
+        
+        if (isNoSeconds) {
+            if (flag24) sdfHmsmde = SimpleDateFormat("H:mm.M月d日 E")
+            else sdfHmsmde = SimpleDateFormat("h:mm.M月d日 E")
+        } else {
+            if (flag24) sdfHmsmde = SimpleDateFormat("H:mmss.M月d日 E")
+            else sdfHmsmde = SimpleDateFormat("h:mmss.M月d日 E")
         }
 
-
         setFullscreen()
-
         setContentView(R.layout.activity_clock)
-//        mediaButtonReceiverInit()
 
+        // 🖼️ 初始化壁纸视图
         wallpaperView = findViewById(R.id.clock_wallpaper)
         wallpaperMaskView = findViewById(R.id.clock_wallpaper_mask)
+
         val tvTop = findViewById<TextView>(R.id.tv_top)
         val tvTime = findViewById<TextView>(R.id.tv_time)
         val tvDate = findViewById<TextView>(R.id.tv_date)
         val circularMusicProgress = findViewById<CircularMusicProgressView>(R.id.circular_music_progress)
         showLyrics = MeSettings.isEnabled(this, MeSettings.KEY_LYRICS)
-        setupClockTextAutoSize(tvTop, tvTime, tvDate)
 
-        // 按钮控制
-//        findViewById<Button>(R.id.btn_back).setOnClickListener {
-//            Toast.makeText(this, "${this.getString(R.string.app_name)} 服务已停止", Toast.LENGTH_SHORT).show()
-//            onDestroy()
-//            MeService.me?.stopSelf()
-//        }
+        // 按钮控制逻辑
         findViewById<Button>(R.id.btn_back).setOnClickListener {
             if (!returnPackage.isNullOrBlank()) {
                 if (!HomeLauncherActivity.revealPreviousTask(this, returnPackage) &&
@@ -179,7 +202,6 @@ class ClockActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             val intent: Intent = Intent(this, MainActivity::class.java)
-            // 清除任务栈并创建新任务
             intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
             startActivity(intent)
         }
@@ -195,42 +217,22 @@ class ClockActivity : AppCompatActivity() {
             }
             startActivity(intent)
         }
-        findViewById<Button>(R.id.btn_prev).setOnClickListener {
-            MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-        }
-        findViewById<Button>(R.id.btn_play).setOnClickListener {
-            MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-        }
-        findViewById<Button>(R.id.btn_next).setOnClickListener {
-            MeService.me?.keyHandleAction(2147483645)
-        }
-        findViewById<Button>(R.id.btn_stop).setOnClickListener {
-            MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_STOP)
-        }
-        findViewById<Button>(R.id.btn_volm).setOnClickListener {
-            MeService.me?.keyHandleAction(2147483646)
-        }
-        findViewById<Button>(R.id.btn_volp).setOnClickListener {
-            MeService.me?.keyHandleAction(2147483647)
-        }
-        findViewById<Button>(R.id.btn_forward).setOnClickListener {
-            MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)
-        }
+        findViewById<Button>(R.id.btn_prev).setOnClickListener { MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_PREVIOUS) }
+        findViewById<Button>(R.id.btn_play).setOnClickListener { MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) }
+        findViewById<Button>(R.id.btn_next).setOnClickListener { MeService.me?.keyHandleAction(2147483645) }
+        findViewById<Button>(R.id.btn_stop).setOnClickListener { MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_STOP) }
+        findViewById<Button>(R.id.btn_volm).setOnClickListener { MeService.me?.keyHandleAction(2147483646) }
+        findViewById<Button>(R.id.btn_volp).setOnClickListener { MeService.me?.keyHandleAction(2147483647) }
+        findViewById<Button>(R.id.btn_forward).setOnClickListener { MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) }
 
         val musicSeekBar = findViewById<SeekBar>(R.id.sb_music_progress)
         val tvMusicPosition = findViewById<TextView>(R.id.tv_music_position)
         val tvMusicDuration = findViewById<TextView>(R.id.tv_music_duration)
         musicSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser) {
-                    tvMusicPosition.text = formatMusicTime(progress)
-                }
+                if (fromUser) tvMusicPosition.text = formatMusicTime(progress)
             }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {
-                isUserSeeking = true
-            }
-
+            override fun onStartTrackingTouch(seekBar: SeekBar?) { isUserSeeking = true }
             override fun onStopTrackingTouch(seekBar: SeekBar?) {
                 seekMusicTo(seekBar?.progress ?: 0)
                 isUserSeeking = false
@@ -245,84 +247,52 @@ class ClockActivity : AppCompatActivity() {
                 seekMusicTo(musicSeekBar.progress)
                 isUserSeeking = false
                 true
-            } else {
-                false
-            }
+            } else false
         }
 
-        val tvGestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+        // 🌟 时间区域手势：单击播放/暂停，长按弹出综合设置
+        val timeGestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
-
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 if (clockMode) {
                     MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-                } else {
-                    isKeepScreenOn = !isKeepScreenOn
-                    if (isKeepScreenOn) {
-                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-//                Toast.makeText(this, "保持亮屏打开", Toast.LENGTH_SHORT).show()
-                        showMsg("保持亮屏 打开")
-                    } else {
-                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-//                Toast.makeText(this, "关闭保持亮屏", Toast.LENGTH_SHORT).show()
-                        showMsg("关闭 保持亮屏")
-                    }
+                    return true
                 }
-                return true
+                return false
             }
-
             override fun onLongPress(e: MotionEvent?) {
-                // 一键 让go决定是要放还是要停
-                showMsg("一键")
-                MeService.me?.toGo("1key")
-                true
+                if (clockMode) {
+                    showTimeSettingsDialog(tvTime, tvDate)
+                } else {
+                    showMsg("一键")
+                    MeService.me?.toGo("1key")
+                }
             }
-
-            override fun onFling(
-                e1: MotionEvent,
-                e2: MotionEvent,
-                velocityX: Float,
-                velocityY: Float
-            ): Boolean {
+            override fun onFling(e1: MotionEvent, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
                 val diffX = e2.x - e1.x
                 val diffY = e2.y - e1.y
                 if (Math.abs(diffX) > Math.abs(diffY)) {
-                    // 水平
                     if (Math.abs(diffX) > 100 && Math.abs(velocityX) > 100) {
-                        if (diffX > 0) {
-                            // 右
-                            MeService.me?.keyHandleAction(2147483645)
-                        } else {
-                            // 左
-                            MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-                        }
+                        if (diffX > 0) MeService.me?.keyHandleAction(2147483645)
+                        else MeService.me?.keyHandleAction(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
                         return true
                     }
                 } else {
-                    // 垂直
                     if (Math.abs(diffY) > 100 && Math.abs(velocityY) > 100) {
-                        if (diffY > 0) {
-                            // 下
-                            MeService.me?.keyHandleAction(2147483646)
-                        } else {
-                            // 上
-                            MeService.me?.keyHandleAction(2147483647)
-                        }
+                        if (diffY > 0) MeService.me?.keyHandleAction(2147483646)
+                        else MeService.me?.keyHandleAction(2147483647)
                         return true
                     }
                 }
                 return false
             }
         })
-        tvTime.setOnTouchListener { v, event ->
-            tvGestureDetector.onTouchEvent(event)
-        }
+        tvTime.setOnTouchListener { v, event -> timeGestureDetector.onTouchEvent(event) }
 
+        // 🌟 日期区域点击与长按逻辑
         tvDate.setOnClickListener {
-            if (clockMode) {
-                recreate()
-            } else {
-                // 切换暗色模式
+            if (clockMode) recreate()
+            else {
                 if (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES) {
                     AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
                 } else {
@@ -330,64 +300,114 @@ class ClockActivity : AppCompatActivity() {
                 }
             }
         }
+        
         tvDate.setOnLongClickListener {
-            val devicePolicyManager = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-            val adminComponentName = ComponentName(this, MeDeviceAdminReceiver::class.java)
-            if (devicePolicyManager.isAdminActive(adminComponentName)) {
-                try {
-                    devicePolicyManager.lockNow()
-                } catch (e: Exception) {
-                    showMsg("锁屏失败: ${e.message}")
+            if (clockMode) {
+                showDateSettingsDialog(tvDate)
+                true
+            } else {
+                val devicePolicyManager = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+                val adminComponentName = ComponentName(this, MeDeviceAdminReceiver::class.java)
+                if (devicePolicyManager.isAdminActive(adminComponentName)) {
+                    try { devicePolicyManager.lockNow() } catch (e: Exception) { showMsg("锁屏失败: ${e.message}") }
                 }
+                true
             }
-            true
         }
-        findViewById<Button>(R.id.btn_minsize).setOnClickListener {
-            setFullScreenClock()
-        }
+        
+        findViewById<Button>(R.id.btn_minsize).setOnClickListener { setFullScreenClock() }
+        
         var screenReverseFlag = false
         findViewById<Button>(R.id.btn_rotation).setOnClickListener {
             requestedOrientation = if (resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT && !screenReverseFlag) {
-                screenReverseFlag = true
-                ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+                screenReverseFlag = true; ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
             } else if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE && !screenReverseFlag) {
-                screenReverseFlag = true
-                ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                screenReverseFlag = true; ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
             } else if (resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT && screenReverseFlag) {
-                // 重载会自动 screenReverseFlag = false
                 ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             } else {
-                // 重载会自动 screenReverseFlag = false
                 ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             }
         }
+        
         val rootLayout = findViewById<LinearLayout>(R.id.root_layout)
         rootLayout.post {
-            // 延迟进行字体大小调整  初始化完后延时执行
-            if (intent.getBooleanExtra("clockMode", false) ||
-                intent.action == "android.media.action.STILL_IMAGE_CAMERA"
-            ) {
-                Log.d("intent", "收到clockMode")
-                // 直接进入全屏时钟模式
+            if (intent.getBooleanExtra("clockMode", false) || intent.action == "android.media.action.STILL_IMAGE_CAMERA") {
                 setFullScreenClock()
             }
-            // 保持亮屏flag
             if (intent.getBooleanExtra("keepOn", false)) {
-                Log.d("intent", "收到keepOn")
                 isKeepScreenOn = true
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
-            // 清空
             intent.replaceExtras(Intent())
         }
 
-
-
-        // 歌词播放时提高刷新频率，其余情况仍按秒刷新
+        // 核心定时器
         runnable = object : Runnable {
             override fun run() {
-                val hmsmde = sdfHmsmde.format(Date()).split(".")
-                setTextIfChanged(tvTime, hmsmde[0])
+                val now = Date()
+                val hmsmde = sdfHmsmde.format(now).split(".")
+                val timeText = hmsmde[0]
+                val isNoSeconds = MeSettings.isEnabled(this@ClockActivity, MeSettings.KEY_TSS)
+                
+                // 🌟 计算农历并拼接到日期字符串中 (带缓存机制)
+                val calendar = Calendar.getInstance()
+                val currentDay = calendar.get(Calendar.DAY_OF_MONTH)
+                if (currentDay != cachedLunarDay) {
+                    cachedLunarDay = currentDay
+                    cachedLunarString = getLunarString(calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH) + 1, currentDay)
+                }
+                val dateParts = hmsmde[1].split(" ")
+                val dateStr = if (dateParts.size >= 2) {
+                    "${dateParts[0]} $cachedLunarString ${dateParts[1]}" 
+                } else {
+                    "${hmsmde[1]} $cachedLunarString"
+                }
+                
+                val spannable = SpannableString(timeText)
+                val normalColor = tvTime.currentTextColor
+                val blinkColor = if (Calendar.getInstance().get(Calendar.SECOND) % 2 == 0) normalColor else Color.TRANSPARENT
+
+                val colonIndex = timeText.indexOf(':')
+                if (colonIndex != -1) {
+                    spannable.setSpan(ForegroundColorSpan(blinkColor), colonIndex, colonIndex + 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    
+                    if (!isNoSeconds) {
+                        val hasNewline = timeText.contains('\n')
+                        val secStartIndex = if (hasNewline) colonIndex + 4 else colonIndex + 3
+                        if (secStartIndex < timeText.length) {
+                            spannable.setSpan(RelativeSizeSpan(0.33f), secStartIndex, timeText.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                        }
+                    }
+                }
+                
+                tvTime.setText(spannable, TextView.BufferType.SPANNABLE)
+
+                // 🛡️ 防烧屏位移逻辑
+                if (clockMode) {
+                    burnInOffsetX += burnInVelocityX
+                    burnInOffsetY += burnInVelocityY
+
+                    if (Math.abs(burnInOffsetX) > maxBurnInOffsetX) {
+                        burnInVelocityX = -burnInVelocityX
+                        burnInOffsetX = burnInOffsetX.coerceIn(-maxBurnInOffsetX, maxBurnInOffsetX)
+                    }
+                    if (Math.abs(burnInOffsetY) > maxBurnInOffsetY) {
+                        burnInVelocityY = -burnInVelocityY
+                        burnInOffsetY = burnInOffsetY.coerceIn(-maxBurnInOffsetY, maxBurnInOffsetY)
+                    }
+
+                    tvTime.translationX = burnInOffsetX
+                    tvTime.translationY = burnInOffsetY
+                    tvDate.translationX = burnInOffsetX
+                    tvDate.translationY = burnInOffsetY
+                    if (enableTop) {
+                        tvTop.translationX = burnInOffsetX
+                        tvTop.translationY = burnInOffsetY
+                    }
+                }
+
+                // 音乐进度与歌词更新
                 val service = MeService.me
                 val millis = service?.getPlaybackPosition()
                 val duration = service?.getPlaybackDuration() ?: 0
@@ -395,37 +415,28 @@ class ClockActivity : AppCompatActivity() {
                 circularMusicProgress.setProgress(millis, duration)
                 val lyric = if (showLyrics) service?.getCurrentLyric(millis) else null
                 if (lyricsOnTop) {
-                    if (tvTop.text.toString() != lyric.orEmpty()) {
-                        tvTop.text = lyric.orEmpty()
-                    }
+                    if (tvTop.text.toString() != lyric.orEmpty()) tvTop.text = lyric.orEmpty()
                 }
                 if (SystemClock.elapsedRealtime() >= showMsgUntil) {
                     val batInfo = service?.batInfo.orEmpty()
-                    val playTime = millis?.let {
-                        String.format("%2d:%02d", it / 60000, (it % 60000) / 1000)
-                    }
+                    val playTime = millis?.let { String.format("%2d:%02d", it / 60000, (it % 60000) / 1000) }
                     if (showLyrics && !clockMode) {
-                        setTextIfChanged(
-                            tvDate,
-                            if (millis != null && lyric != null) lyric else batInfo + hmsmde[1]
-                        )
+                        setTextIfChanged(tvDate, if (millis != null && lyric != null) lyric else batInfo + dateStr)
                     } else if (lyricsOnTop) {
                         if (isVerticalLayout) {
                             val secondLine = (batInfo + (playTime?.let { "▷$it" } ?: "")).trimEnd()
-                            setTextIfChanged(
-                                tvDate,
-                                hmsmde[1] + (secondLine.takeIf { it.isNotEmpty() }?.let { "\n$it" } ?: "")
-                            )
+                            setTextIfChanged(tvDate, dateStr + (secondLine.takeIf { it.isNotEmpty() }?.let { "\n$it" } ?: ""))
                         } else {
-                            setTextIfChanged(tvDate, batInfo + hmsmde[1] + (playTime?.let { " ▷$it" } ?: ""))
+                            setTextIfChanged(tvDate, batInfo + dateStr + (playTime?.let { " ▷$it" } ?: ""))
                         }
                     } else if (enableTop) {
                         setTextIfChanged(tvTop, batInfo + (playTime?.let { "▷$it" } ?: ""))
-                        setTextIfChanged(tvDate, hmsmde[1])
+                        setTextIfChanged(tvDate, dateStr)
                     } else {
-                        setTextIfChanged(tvDate, batInfo + hmsmde[1] + (playTime?.let { " ▷$it" } ?: ""))
+                        setTextIfChanged(tvDate, batInfo + dateStr + (playTime?.let { " ▷$it" } ?: ""))
                     }
                 }
+                
                 if (showLyrics && millis != null) {
                     timeHandler.postDelayed(this, 250)
                 } else {
@@ -434,7 +445,152 @@ class ClockActivity : AppCompatActivity() {
             }
         }
         timeHandler.postDelayed(runnable as Runnable, 1000 - System.currentTimeMillis() % 1000)
+    }
 
+    // 🌟 综合设置对话框：时钟大小、粗细、间距
+    private fun showTimeSettingsDialog(tvTime: TextView, tvDate: TextView) {
+        val context = this
+        val layout = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(50, 30, 50, 30)
+        }
+
+        val tvSizeTitle = TextView(context).apply { text = "时钟字体大小: ${(getFontScale() * 100).toInt()}%"; textSize = 16f; setPadding(0, 0, 0, 10) }
+        val sbSize = SeekBar(context).apply { max = 300; progress = ((getFontScale() - 1.0f) * 100).toInt() }
+        sbSize.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    val scale = 1.0f + progress / 100f
+                    tvSizeTitle.text = "时钟字体大小: ${(scale * 100).toInt()}%"
+                    applyTimeSettings(tvTime, tvDate, scale, getFontWeight(), getTimeDateMargin())
+                }
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        layout.addView(tvSizeTitle)
+        layout.addView(sbSize)
+
+        val tvWeightTitle = TextView(context).apply { text = "时钟字体粗细: ${getWeightText(getFontWeight())}"; textSize = 16f; setPadding(0, 30, 0, 10) }
+        val sbWeight = SeekBar(context).apply { max = 2; progress = getFontWeight() }
+        sbWeight.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    tvWeightTitle.text = "时钟字体粗细: ${getWeightText(progress)}"
+                    applyTimeSettings(tvTime, tvDate, getFontScale(), progress, getTimeDateMargin())
+                }
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        layout.addView(tvWeightTitle)
+        layout.addView(sbWeight)
+
+        val tvMarginTitle = TextView(context).apply { text = "时钟与日期间距: ${getTimeDateMargin()}dp"; textSize = 16f; setPadding(0, 30, 0, 10) }
+        val sbMargin = SeekBar(context).apply { 
+            max = 300
+            progress = getTimeDateMargin() + 200 
+        }
+        sbMargin.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    val margin = progress - 200 
+                    tvMarginTitle.text = "时钟与日期间距: ${margin}dp"
+                    applyTimeSettings(tvTime, tvDate, getFontScale(), getFontWeight(), margin)
+                }
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        layout.addView(tvMarginTitle)
+        layout.addView(sbMargin)
+
+        AlertDialog.Builder(this)
+            .setTitle("时钟显示设置")
+            .setView(layout)
+            .setPositiveButton("确定") { dialog, _ ->
+                setFontScale(1.0f + sbSize.progress / 100f)
+                setFontWeight(sbWeight.progress)
+                setTimeDateMargin(sbMargin.progress - 200) 
+                dialog.dismiss()
+            }
+            .setNegativeButton("取消") { dialog, _ ->
+                applyTimeSettings(tvTime, tvDate, getFontScale(), getFontWeight(), getTimeDateMargin())
+                dialog.dismiss()
+            }
+            .show()
+    }
+
+    private fun showDateSettingsDialog(tvDate: TextView) {
+        val context = this
+        val layout = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(50, 30, 50, 30)
+        }
+
+        val currentPercent = (getDateFontScale() * 100).toInt()
+        val tvTitle = TextView(context).apply { text = "日期字体大小: ${currentPercent}%"; textSize = 16f; setPadding(0, 0, 0, 10) }
+        
+        val sb = SeekBar(context).apply { 
+            max = 190
+            progress = (currentPercent - 10).coerceIn(0, 190)
+        }
+        
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    val scale = (10f + progress) / 100f 
+                    tvTitle.text = "日期字体大小: ${(scale * 100).toInt()}%"
+                    applyDateSettings(tvDate, scale)
+                }
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        layout.addView(tvTitle)
+        layout.addView(sb)
+
+        AlertDialog.Builder(this)
+            .setTitle("日期显示设置")
+            .setView(layout)
+            .setPositiveButton("确定") { dialog, _ ->
+                val finalScale = (10f + sb.progress) / 100f
+                setDateFontScale(finalScale)
+                dialog.dismiss()
+            }
+            .setNegativeButton("取消") { dialog, _ ->
+                applyDateSettings(tvDate, getDateFontScale())
+                dialog.dismiss()
+            }
+            .show()
+    }
+
+    private fun applyTimeSettings(tvTime: TextView, tvDate: TextView, scale: Float, weight: Int, marginDp: Int) {
+        tvTime.paint.isFakeBoldText = (weight >= 2)
+        tvTime.setTypeface(tvTime.typeface, if (weight >= 1) Typeface.BOLD else Typeface.NORMAL)
+        
+        val params = tvDate.layoutParams as LinearLayout.LayoutParams
+        params.topMargin = (marginDp * resources.displayMetrics.density).toInt()
+        tvDate.layoutParams = params
+
+        val newHeight = (baseTimeHeight * scale).toInt()
+        tvTime.layoutParams.height = newHeight
+        tvTime.requestLayout()
+        
+        val maxTimeSize = (1000f * scale).toInt()
+        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(tvTime, 18, maxTimeSize, 1, TypedValue.COMPLEX_UNIT_SP)
+        
+        val currentText = tvTime.text
+        tvTime.text = ""
+        tvTime.text = currentText
+    }
+
+    private fun applyDateSettings(tvDate: TextView, scale: Float) {
+        val maxDateSize = (80f * scale).toInt()
+        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(tvDate, 8, maxDateSize, 1, TypedValue.COMPLEX_UNIT_SP)
+        val currentText = tvDate.text
+        tvDate.text = ""
+        tvDate.text = currentText
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -445,15 +601,16 @@ class ClockActivity : AppCompatActivity() {
         }
     }
 
-    override fun onStart() {
+    override fun onStart() { 
         super.onStart()
-        isActivityStarted = true
+        isActivityStarted = true 
+        // 🖥️ 请求最新串流帧
         FramebufferFrameRenderer.requestLatestFrame()
     }
-
-    override fun onStop() {
+    
+    override fun onStop() { 
         isActivityStarted = false
-        super.onStop()
+        super.onStop() 
     }
 
     override fun onResume() {
@@ -476,18 +633,16 @@ class ClockActivity : AppCompatActivity() {
             recreate()
             return
         }
-
+        
         if (!returnPackage.isNullOrBlank()) {
             if (!HomeLauncherActivity.revealPreviousTask(this, returnPackage) &&
                 !HomeLauncherActivity.returnToPreviousApp(this, returnPackage)) moveTaskToBack(true)
             return
         }
-
-        // 默认时钟模式的设备 返回退到main控制台
-        if (MeSettings.isEnabled(this, MeSettings.KEY_CLOCK)) {
+        
+        if (MeService.clockModeModel.contains(Build.MANUFACTURER + Build.MODEL) || MeSettings.isEnabled(this, MeSettings.KEY_CLOCK)) {
             val intent: Intent = Intent(this, MainActivity::class.java)
-            startActivity(intent)
-            finish()
+            startActivity(intent); finish()
         } else {
             super.onBackPressed()
         }
@@ -501,6 +656,7 @@ class ClockActivity : AppCompatActivity() {
         findViewById<LinearLayout>(R.id.btm_layout3).visibility = View.GONE
         findViewById<LinearLayout>(R.id.btm_layout4).visibility = View.GONE
         findViewById<LinearLayout>(R.id.music_progress_layout).visibility = View.GONE
+
         loadClockWallpaper()
         scheduleHourlyWallpaperUpdates()
 
@@ -513,24 +669,20 @@ class ClockActivity : AppCompatActivity() {
         val rootLayout = findViewById<LinearLayout>(R.id.root_layout)
         var realHeightPixels = rootLayout.height
         var realWidthPixels = rootLayout.width
+        
         if (Build.MODEL == "HPN_XH") {
-            // Android4.4的HPN_XH少了一个状态栏的高度
             val statusBarId = resources.getIdentifier("status_bar_height", "dimen", "android")
-            if (statusBarId != 0) {
-                realHeightPixels += resources.getDimensionPixelSize(statusBarId)
-            }
+            if (statusBarId != 0) realHeightPixels += resources.getDimensionPixelSize(statusBarId)
         }
-        isVerticalLayout = displayMetrics.heightPixels / displayMetrics.widthPixels.toFloat() > 1.15 ||  MeSettings.isEnabled(this, MeSettings.KEY_VERTICAL)
+        
+        isVerticalLayout = displayMetrics.heightPixels / displayMetrics.widthPixels.toFloat() > 1.15 || MeSettings.isEnabled(this, MeSettings.KEY_VERTICAL)
         val isRound = rootLayout.height == rootLayout.width || MeSettings.isEnabled(this, MeSettings.KEY_ROUND)
         circularMusicProgress.visibility = if (isRound) View.VISIBLE else View.GONE
-        Log.d("ClockActivity", "realHeight: $realHeightPixels realWidth: ${realWidthPixels} height: ${displayMetrics.heightPixels} width: ${displayMetrics.widthPixels} density: ${displayMetrics.density} 比例:${displayMetrics.heightPixels / displayMetrics.widthPixels.toFloat()}")
+        
         if (isRound) {
-            // 圆形屏幕 增加上下边距
-            Log.d("ClockActivity", "圆形屏幕")
             val topPadding = realHeightPixels / 8
             val bottomPadding = (topPadding - (realWidthPixels - realHeightPixels).coerceAtLeast(0)).coerceAtLeast(0)
             rootLayout.setPadding(0, topPadding, 0, bottomPadding)
-            // 自动计算大小 搞个左右的边距
             val textHorizontalPadding = 10
             val edgeHorizontalPadding = (realWidthPixels / 7) + textHorizontalPadding
             tvTop.setPadding(edgeHorizontalPadding, tvTop.paddingTop, edgeHorizontalPadding, tvTop.paddingBottom)
@@ -538,34 +690,44 @@ class ClockActivity : AppCompatActivity() {
             tvDate.setPadding(edgeHorizontalPadding, tvDate.paddingTop, edgeHorizontalPadding, tvDate.paddingBottom)
             realHeightPixels -= topPadding + bottomPadding
         }
+
+        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val isNoSeconds = MeSettings.isEnabled(this, MeSettings.KEY_TSS)
+
+        var baseTimeHeightRatio = 0.75f
         if (isRound || isVerticalLayout || showLyrics) {
-            // 圆屏、竖屏或歌词模式启用顶部框
-            tvTime.layoutParams.height = (realHeightPixels * 0.5).toInt()
-            tvTop.layoutParams.height = (realHeightPixels * 0.25).toInt()
-            enableTop = true
-        } else {
-            tvTime.layoutParams.height = (realHeightPixels * 0.75).toInt()
-            tvTop.layoutParams.height = 0
-            enableTop = false
+            baseTimeHeightRatio = 0.5f
+        } else if (isLandscape && isNoSeconds) {
+            baseTimeHeightRatio = 0.85f
         }
+        baseTimeHeight = (realHeightPixels * baseTimeHeightRatio).toInt()
+        
+        tvTop.layoutParams.height = if (isRound || isVerticalLayout || showLyrics) (realHeightPixels * 0.25).toInt() else 0
+        enableTop = isRound || isVerticalLayout || showLyrics
         tvDate.layoutParams.height = (realHeightPixels * 0.25).toInt()
 
+        // 初始化防烧屏参数
+        val density = displayMetrics.density
+        burnInVelocityX = (if (Math.random() > 0.5) 1 else -1) * 15f * density
+        burnInVelocityY = (if (Math.random() > 0.5) 1 else -1) * 15f * density
+        maxBurnInOffsetX = realWidthPixels * 0.12f
+        maxBurnInOffsetY = realHeightPixels * 0.12f
+        
+        burnInOffsetX = (Math.random() * maxBurnInOffsetX * 2 - maxBurnInOffsetX).toFloat()
+        burnInOffsetY = (Math.random() * maxBurnInOffsetY * 2 - maxBurnInOffsetY).toFloat()
+
+        // 启动时应用所有保存的自定义设置
+        applyTimeSettings(tvTime, tvDate, getFontScale(), getFontWeight(), getTimeDateMargin())
+        applyDateSettings(tvDate, getDateFontScale())
+
         if (isVerticalLayout) {
-            // 竖屏秒换行
-            if (!MeSettings.isEnabled(this, MeSettings.KEY_TSS)) {
-                if (MeSettings.isEnabled(this, MeSettings.KEY_T24)) {
-                    sdfHmsmde = SimpleDateFormat("H:mm\nss.M月d日 E")
-                } else {
-                    sdfHmsmde = SimpleDateFormat("h:mm\nss.M月d日 E")
-                }
+            if (isNoSeconds) {
+                if (MeSettings.isEnabled(this, MeSettings.KEY_T24)) sdfHmsmde = SimpleDateFormat("H:mm\nss.M月d日 E")
+                else sdfHmsmde = SimpleDateFormat("h:mm\nss.M月d日 E")
             }
             tvTime.maxLines = 2
         }
-        if (isRound) {
-            // 用竖屏布局，让tvDate元素换行
-            isVerticalLayout = true
-        }
-        setupClockTextAutoSize(tvTop, tvTime, tvDate)
+        if (isRound) isVerticalLayout = true
     }
 
     private fun scheduleHourlyWallpaperUpdates() {
@@ -588,20 +750,13 @@ class ClockActivity : AppCompatActivity() {
 
     private fun listAutoWallpaperFiles(): List<File> {
         return try {
-            if (!autoWallpaperDirectory.exists()) {
-                autoWallpaperDirectory.mkdirs()
-            }
-            if (!autoWallpaperDirectory.isDirectory) {
-                emptyList()
-            } else {
-                autoWallpaperDirectory.listFiles()
-                    ?.filter { it.isFile && isAutoWallpaperFile(it) }
-                    ?.sortedBy { it.name.lowercase(Locale.ROOT) }
-                    .orEmpty()
-            }
-        } catch (_: SecurityException) {
-            emptyList()
-        }
+            if (!autoWallpaperDirectory.exists()) autoWallpaperDirectory.mkdirs()
+            if (!autoWallpaperDirectory.isDirectory) emptyList()
+            else autoWallpaperDirectory.listFiles()
+                ?.filter { it.isFile && isAutoWallpaperFile(it) }
+                ?.sortedBy { it.name.lowercase(Locale.ROOT) }
+                .orEmpty()
+        } catch (_: SecurityException) { emptyList() }
     }
 
     private fun isAutoWallpaperFile(file: File): Boolean {
@@ -612,8 +767,7 @@ class ClockActivity : AppCompatActivity() {
     }
 
     private fun hasSameAutoWallpaperFiles(files: List<File>): Boolean {
-        return files.map { it.absolutePath }.toSet() ==
-                autoWallpaperFiles.map { it.absolutePath }.toSet()
+        return files.map { it.absolutePath }.toSet() == autoWallpaperFiles.map { it.absolutePath }.toSet()
     }
 
     private fun shuffleAutoWallpaperFiles(files: List<File>, avoid: File? = null): List<File> {
@@ -633,7 +787,6 @@ class ClockActivity : AppCompatActivity() {
             loadClockWallpaper()
             return
         }
-
         val previous = currentAutoWallpaper
         if (!hasSameAutoWallpaperFiles(files) || autoWallpaperIndex !in autoWallpaperFiles.indices) {
             autoWallpaperFiles = shuffleAutoWallpaperFiles(files, previous)
@@ -656,9 +809,7 @@ class ClockActivity : AppCompatActivity() {
             currentAutoWallpaper = null
             return null
         }
-        if (!hasSameAutoWallpaperFiles(files) ||
-            currentAutoWallpaper == null || !currentAutoWallpaper!!.isFile
-        ) {
+        if (!hasSameAutoWallpaperFiles(files) || currentAutoWallpaper == null || !currentAutoWallpaper!!.isFile) {
             autoWallpaperFiles = shuffleAutoWallpaperFiles(files)
             autoWallpaperIndex = 0
             currentAutoWallpaper = autoWallpaperFiles[autoWallpaperIndex]
@@ -672,17 +823,12 @@ class ClockActivity : AppCompatActivity() {
         val auto = selectAutoWallpaper()
         val selected = auto ?: File(filesDir, "desk.jpg")
         val bitmap = decodeSampledFileSafely(selected, width, height)
-            ?: if (auto != null) {
-                decodeSampledFileSafely(File(filesDir, "desk.jpg"), width, height)
-            } else {
-                null
-            }
+            ?: if (auto != null) decodeSampledFileSafely(File(filesDir, "desk.jpg"), width, height) else null
 
         if (bitmap == null) {
             hideClockWallpaper()
             return
         }
-
         val old = wallpaperBitmap
         wallpaperBitmap = bitmap
         wallpaperView.setImageBitmap(bitmap)
@@ -699,6 +845,7 @@ class ClockActivity : AppCompatActivity() {
         wallpaperBitmap = null
     }
 
+    // 🖥️ Framebuffer 串流显示逻辑 (来自第一版)
     internal fun showFramebufferFrame(bitmap: Bitmap): Bitmap? {
         if (isFinishing) {
             if (!bitmap.isRecycled) bitmap.recycle()
@@ -734,58 +881,25 @@ class ClockActivity : AppCompatActivity() {
 
     private fun decodeSampledFileSafely(file: File, width: Int, height: Int): Bitmap? {
         return if (file.exists() && file.length() > 0L) {
-            try {
-                decodeSampledFile(file, width, height)
-            } catch (_: Exception) {
-                null
-            }
-        } else {
-            null
-        }
+            try { decodeSampledFile(file, width, height) } catch (_: Exception) { null }
+        } else null
     }
 
     private fun decodeSampledFile(file: File, width: Int, height: Int): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight, width, height)
-        }
+        val options = BitmapFactory.Options().apply { inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight, width, height) }
         return BitmapFactory.decodeFile(file.absolutePath, options)
     }
 
     private fun calculateSampleSize(sourceWidth: Int, sourceHeight: Int, width: Int, height: Int): Int {
         var sample = 1
-        while (sourceWidth / (sample * 2) >= width && sourceHeight / (sample * 2) >= height) {
-            sample *= 2
-        }
+        while (sourceWidth / (sample * 2) >= width && sourceHeight / (sample * 2) >= height) sample *= 2
         return sample
     }
 
-    private fun setupClockTextAutoSize(tvTop: TextView, tvTime: TextView, tvDate: TextView) {
-        // 修改字号需要同步修改
-        setUniformAutoSize(tvTop, 8, 80)
-        setUniformAutoSize(tvTime, 18, 400)
-        setUniformAutoSize(tvDate, 8, 80)
-    }
-
-    private fun setUniformAutoSize(textView: TextView, minSp: Int, maxSp: Int) {
-        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(
-            textView,
-            minSp,
-            maxSp,
-            1,
-            TypedValue.COMPLEX_UNIT_SP
-        )
-    }
-
-    private fun updateMusicProgress(
-        seekBar: SeekBar,
-        positionView: TextView,
-        durationView: TextView,
-        position: Int?,
-        duration: Int
-    ) {
+    private fun updateMusicProgress(seekBar: SeekBar, positionView: TextView, durationView: TextView, position: Int?, duration: Int) {
         if (position == null || duration <= 0) {
             if (seekBar.max != 0) seekBar.max = 0
             if (seekBar.progress != 0) seekBar.progress = 0
@@ -795,11 +909,8 @@ class ClockActivity : AppCompatActivity() {
             setTextIfChanged(durationView, emptyTime)
             return
         }
-
         if (!seekBar.isEnabled) seekBar.isEnabled = true
-        if (seekBar.max != duration) {
-            seekBar.max = duration
-        }
+        if (seekBar.max != duration) seekBar.max = duration
         if (!isUserSeeking) {
             val progress = position.coerceIn(0, duration)
             if (seekBar.progress != progress) seekBar.progress = progress
@@ -808,47 +919,33 @@ class ClockActivity : AppCompatActivity() {
         setTextIfChanged(durationView, formatMusicTime(duration))
     }
 
-    private fun setTextIfChanged(view: TextView, text: String) {
-        if (view.text.toString() != text) view.text = text
+    // 使用 CharSequence 以支持 SpannableString
+    private fun setTextIfChanged(view: TextView, text: CharSequence) {
+        if (view.text.toString() != text.toString()) view.text = text
     }
 
-    private fun seekMusicTo(target: Int) {
-        MeService.me?.seekPlaybackTo(target)
-    }
+    private fun seekMusicTo(target: Int) { MeService.me?.seekPlaybackTo(target) }
 
     private fun formatMusicTime(millis: Int): String {
         val totalSeconds = millis.coerceAtLeast(0) / 1000
         val hours = totalSeconds / 3600
         val minutes = totalSeconds % 3600 / 60
         val seconds = totalSeconds % 60
-        return if (hours > 0) {
-            String.format("%d:%02d:%02d", hours, minutes, seconds)
-        } else {
-            String.format("%d:%02d", minutes, seconds)
-        }
+        return if (hours > 0) String.format("%d:%02d:%02d", hours, minutes, seconds)
+        else String.format("%d:%02d", minutes, seconds)
     }
 
     private fun setFullscreen() {
-        // 这个音箱刚需overscan，为了这个特殊处理一下
         if (Build.MODEL == "HPN_XH") {
-            window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
+            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
         } else {
             window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION         // 添加此行以隐藏导航栏
-                            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
-
-
-            // 新版Android
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
-            // false时按钮会显示到挖孔的区域
             WindowCompat.setDecorFitsSystemWindows(window, false)
             WindowInsetsControllerCompat(window, window.decorView).let { controller ->
                 controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -858,16 +955,13 @@ class ClockActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-//        mediaButtonReceiverDestroy()
-        // 时间计时器回收
         timeHandler.removeCallbacks(hourlyWallpaperRunnable)
-        if (runnable != null) {
-            timeHandler.removeCallbacks(runnable!!)
-        }
+        if (runnable != null) timeHandler.removeCallbacks(runnable!!)
+        
+        // 🖥️ 销毁串流视图
         hideFramebufferFrame()
+        
         if (::wallpaperView.isInitialized) hideClockWallpaper()
-//        stopService(Intent(this, MeService::class.java))
-//        Toast.makeText(this, "${this.getString(R.string.app_name)} 在后台运行", Toast.LENGTH_SHORT).show()
         me = null
         super.onDestroy()
     }
@@ -875,74 +969,170 @@ class ClockActivity : AppCompatActivity() {
     override fun dispatchKeyEvent(keyEvent: KeyEvent?): Boolean {
         if (clockMode) {
             when (keyEvent?.action) {
-                KeyEvent.ACTION_DOWN -> {
-                    if (MeService.me?.keyHandle(keyEvent.keyCode, true) == true) {
-                        return true
-                    }
-                }
-                KeyEvent.ACTION_UP -> {
-                    if (MeService.me?.keyHandle(keyEvent.keyCode, false) == true) {
-                        return true
-                    }
-                }
+                KeyEvent.ACTION_DOWN -> { if (MeService.me?.keyHandle(keyEvent.keyCode, true) == true) return true }
+                KeyEvent.ACTION_UP -> { if (MeService.me?.keyHandle(keyEvent.keyCode, false) == true) return true }
             }
         }
         return super.dispatchKeyEvent(keyEvent)
     }
 
-    /**
-     * 初始化媒体按键监听
-     * 是的，除了写个监听器还要超麻烦的初始化
-     */
     private fun mediaButtonReceiverInit() {
         val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
         mediaComponentName = ComponentName(packageName, MeMediaButtonReceiver::class.java.name).apply {
-            packageManager.setComponentEnabledSetting(
-                this,
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP
-            )
-            // Android 5.0
+            packageManager.setComponentEnabledSetting(this, PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP)
             if (Build.VERSION.SDK_INT >= 21) {
-                mediaSessionCompat =
-                    MediaSessionCompat(this@ClockActivity, "WorkdayAlarmClock", this, null).apply {
-                        //指明支持的按键信息类型
-                        setFlags(
-                            MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
-                                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
-                        )
-
-                        setCallback(object : MediaSessionCompat.Callback() {
-                            override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
-                                MeMediaButtonReceiver().onReceive(this@ClockActivity, mediaButtonEvent)
-                                return true
-                            }
-                        }, Handler(Looper.getMainLooper()))
-                        isActive = true
-                    }
-
+                mediaSessionCompat = MediaSessionCompat(this@ClockActivity, "WorkdayAlarmClock", this, null).apply {
+                    setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
+                    setCallback(object : MediaSessionCompat.Callback() {
+                        override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
+                            MeMediaButtonReceiver().onReceive(this@ClockActivity, mediaButtonEvent); return true
+                        }
+                    }, Handler(Looper.getMainLooper()))
+                    isActive = true
+                }
             } else {
                 audioManager.registerMediaButtonEventReceiver(this)
             }
         }
-
     }
 
-    /**
-     * 销毁媒体按键监听
-     */
     private fun mediaButtonReceiverDestroy() {
         val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
-        // Android 5.0
         if (Build.VERSION.SDK_INT >= 21) {
-            mediaSessionCompat?.let {
-                it.setCallback(null)
-                it.release()
-            }
+            mediaSessionCompat?.let { it.setCallback(null); it.release() }
         } else {
-            mediaComponentName?.let {
-                audioManager.unregisterMediaButtonEventReceiver(it)
-            }
-
+            mediaComponentName?.let { audioManager.unregisterMediaButtonEventReceiver(it) }
         }
     }
+
+    // ================= 🌟 农历算法开始 =================
+    private val lunarInfo = intArrayOf(
+        0x04bd8, 0x04ae0, 0x0a570, 0x054d5, 0x0d260, 0x0d950, 0x16554, 0x056a0, 0x09ad0, 0x055d2,
+        0x04ae0, 0x0a5b6, 0x0a4d0, 0x0d250, 0x1d255, 0x0b540, 0x0d6a0, 0x0ada2, 0x095b0, 0x14977,
+        0x04970, 0x0a4b0, 0x0b4b5, 0x06a50, 0x06d40, 0x1ab54, 0x02b60, 0x09570, 0x052f2, 0x04970,
+        0x06566, 0x0d4a0, 0x0ea50, 0x06e95, 0x05ad0, 0x02b60, 0x186e3, 0x092e0, 0x1c8d7, 0x0c950,
+        0x0d4a0, 0x1d8a6, 0x0b550, 0x056a0, 0x1a5b4, 0x025d0, 0x092d0, 0x0d2b2, 0x0a950, 0x0b557,
+        0x06ca0, 0x0b550, 0x15355, 0x04da0, 0x0a5b0, 0x14573, 0x052b0, 0x0a9a8, 0x0e950, 0x06aa0,
+        0x0aea6, 0x0ab50, 0x04b60, 0x0aae4, 0x0a570, 0x05260, 0x0f263, 0x0d950, 0x05b57, 0x056a0,
+        0x096d0, 0x04dd5, 0x04ad0, 0x0a4d0, 0x0d4d4, 0x0d250, 0x0d558, 0x0b540, 0x0b6a0, 0x195a6,
+        0x095b0, 0x049b0, 0x0a974, 0x0a4b0, 0x0b27a, 0x06a50, 0x06d40, 0x0af46, 0x0ab60, 0x09570,
+        0x04af5, 0x04970, 0x064b0, 0x074a3, 0x0ea50, 0x06b58, 0x05ac0, 0x0ab60, 0x096d5, 0x092e0,
+        0x0c960, 0x0d954, 0x0d4a0, 0x0da50, 0x07552, 0x056a0, 0x0abb7, 0x025d0, 0x092d0, 0x0cab5,
+        0x0a950, 0x0b4a0, 0x0baa4, 0x0ad50, 0x055d9, 0x04ba0, 0x0a5b0, 0x15176, 0x052b0, 0x0a930,
+        0x07954, 0x06aa0, 0x0ad50, 0x05b52, 0x04b60, 0x0a6e6, 0x0a4e0, 0x0d260, 0x0ea65, 0x0d530,
+        0x05aa0, 0x076a3, 0x096d0, 0x04bd7, 0x04ad0, 0x0a4d0, 0x1d0b6, 0x0d250, 0x0d520, 0x0dd45,
+        0x0b5a0, 0x056d0, 0x055b2, 0x049b0, 0x0a577, 0x0a4b0, 0x0aa50, 0x1b255, 0x06d20, 0x0ada0, 0x14b63
+    )
+
+    private fun lYearDays(y: Int): Int {
+        var sum = 348
+        var i = 0x8000
+        while (i > 0x8) {
+            if ((lunarInfo[y - 1900] and i) != 0) sum += 1
+            i = i shr 1
+        }
+        return sum + leapDays(y)
+    }
+
+    private fun leapDays(y: Int): Int {
+        return if (leapMonth(y) != 0) {
+            if ((lunarInfo[y - 1900] and 0x10000) != 0) 30 else 29
+        } else 0
+    }
+
+    private fun leapMonth(y: Int): Int {
+        return lunarInfo[y - 1900] and 0xf
+    }
+
+    private fun monthDays(y: Int, m: Int): Int {
+        return if ((lunarInfo[y - 1900] and (0x10000 shr m)) != 0) 30 else 29
+    }
+
+    private data class LunarDate(val year: Int, val month: Int, val day: Int, val isLeap: Boolean)
+
+    private fun getLunarDate(year: Int, month: Int, day: Int): LunarDate {
+        val utcZone = TimeZone.getTimeZone("UTC")
+        val cal1 = Calendar.getInstance(utcZone)
+        cal1.set(year, month - 1, day, 0, 0, 0)
+        cal1.set(Calendar.MILLISECOND, 0)
+        
+        val cal2 = Calendar.getInstance(utcZone)
+        cal2.set(1900, 0, 31, 0, 0, 0)
+        cal2.set(Calendar.MILLISECOND, 0)
+        
+        var offset = ((cal1.timeInMillis - cal2.timeInMillis) / 86400000).toInt()
+        
+        var i = 1900
+        var temp = 0
+        while (i < 2050 && offset > 0) {
+            temp = lYearDays(i)
+            offset -= temp
+            i++
+        }
+        if (offset < 0) {
+            offset += temp
+            i--
+        }
+        val lunarYear = i
+        val leap = leapMonth(lunarYear)
+        var isLeap = false
+
+        i = 1
+        while (i < 13 && offset > 0) {
+            if (leap > 0 && i == (leap + 1) && !isLeap) {
+                --i
+                isLeap = true
+                temp = leapDays(lunarYear)
+            } else {
+                temp = monthDays(lunarYear, i)
+            }
+            if (isLeap && i == (leap + 1)) {
+                isLeap = false
+            }
+            offset -= temp
+            i++
+        }
+
+        if (offset == 0 && leap > 0 && i == leap + 1) {
+            if (isLeap) {
+                isLeap = false
+            } else {
+                isLeap = true
+                --i
+            }
+        }
+        if (offset < 0) {
+            offset += temp
+            --i
+        }
+
+        return LunarDate(lunarYear, i, offset + 1, isLeap)
+    }
+
+    private val nStr1 = arrayOf("", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
+    private val nStr2 = arrayOf("初", "十", "廿", "卅", "□")
+
+    private fun getCDay(d: Int): String {
+        return when (d) {
+            10 -> "初十"
+            20 -> "二十"
+            30 -> "三十"
+            else -> nStr2[d / 10] + nStr1[d % 10]
+        }
+    }
+
+    private fun getCMon(m: Int): String {
+        return if (m == 1) "正月" else "${nStr1[m]}月"
+    }
+
+    private fun getLunarString(year: Int, month: Int, day: Int): String {
+        val lunar = getLunarDate(year, month, day)
+        var monStr = getCMon(lunar.month)
+        val dayStr = getCDay(lunar.day)
+        if (lunar.isLeap) {
+            monStr = "闰$monStr" 
+        }
+        return "$monStr$dayStr" 
+    }
+    // ================= 🌟 农历算法结束 =================
 }
